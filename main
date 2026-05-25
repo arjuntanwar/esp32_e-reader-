@@ -1,0 +1,640 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SPI.h>
+#include "SPIFFS.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <time.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
+#include <esp_timer.h>
+#include <ArduinoJson.h>
+
+// ================= DISPLAY CONFIGURATION =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define SDA_PIN 8
+#define SCL_PIN 9
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+#define OLED_POWER_PIN 10
+
+// ================= BUTTON CONFIGURATION =================
+#define BTN_UP     3
+#define BTN_DOWN   4
+#define BTN_SELECT 5
+#define BTN_BACK   6
+
+// ================= WIFI CONFIGURATION =================
+const char* ap_ssid = "FPV_CAM";
+const char* ap_password = "";
+const char* wifi_ssid = "FPV_CAM";
+const char* wifi_password = "12345678";
+
+// Timezone: IST (UTC+5:30)
+const long gmtOffset_sec = 19800;
+const int daylightOffset_sec = 0;
+const char* ntpServer = "pool.ntp.org";
+
+// ================= SYSTEM CONSTANTS =================
+#define MAX_CHAPTERS 10
+#define MAX_TOPICS 20
+#define MAX_LINES 500
+#define DEBOUNCE_DELAY 200
+#define LINES_PER_SCREEN 8
+#define VISIBLE_ITEMS 5
+#define WATCH_SLEEP_TIMEOUT_MS 30000
+
+// ================= RTC MEMORY =================
+RTC_DATA_ATTR int rtc_lastChapter = 0;
+RTC_DATA_ATTR int rtc_lastTopic = 0;
+RTC_DATA_ATTR int rtc_lastScrollPos = 0;
+RTC_DATA_ATTR bool rtc_hasResumeData = false;
+RTC_DATA_ATTR unsigned long rtc_bootCount = 0;
+
+// Time stored in RTC
+RTC_DATA_ATTR unsigned long rtc_unixTime = 0;
+RTC_DATA_ATTR uint64_t rtc_sleepEnterTime = 0;
+RTC_DATA_ATTR bool rtc_timeSet = false;
+
+// ================= SYSTEM VARIABLES =================
+enum Mode { MODE_WATCH, MODE_READER, MODE_AP, MODE_TIME_SYNC };
+Mode currentMode = MODE_WATCH;
+
+enum ScreenID { SCR_MAIN, SCR_CHAPTERS, SCR_TOPICS, SCR_READ };
+ScreenID readerScreen = SCR_MAIN;
+
+int readerCursor = 0;
+int readerScrollTop = 0;
+int selectedChapter = 0;
+int selectedTopic = 0;
+int scrollPosition = 0;
+
+String chapters[MAX_CHAPTERS];
+int chapterCount = 0;
+String topics[MAX_TOPICS];
+int topicCount = 0;
+String currentChapter = "";
+String textLines[MAX_LINES];
+int lineCount = 0;
+
+int brightness = 200;
+
+// Current time variables
+int hours = 12, minutes = 0, seconds = 0;
+int day = 1, month = 1, year = 2024;
+int weekDay = 3;
+unsigned long lastTick = 0;
+
+bool apEnabled = false;
+WebServer server(80);
+unsigned long lastButtonTime = 0;
+unsigned long lastActivityTime = 0;
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================= FUNCTION PROTOTYPES =================
+void initSPIFFS();
+void loadChapters();
+void saveChapters();
+void loadTopics(int ch);
+void saveTopics(int ch);
+void loadContent(int ch, int topic);
+bool saveContent(int ch, int topic, String content);
+void addChapter(String name);
+void deleteChapter(int ch);
+void addTopic(int ch, String name);
+void deleteTopic(int ch, int topic);
+void renameChapter(int ch, String name);
+void renameTopic(int ch, int topic, String name);
+void setupAPMode();
+void setupWebServer();
+void syncTimeWithWiFi();
+void updateTimeFromUnix();
+void saveTimeToRTC();
+void loadTimeFromRTC();
+void goToSleep();
+void showMessage(String msg);
+String getWeekday();
+int getDaysInMonth(int month, int year);
+void displayWatchFace();
+void displayMenu();
+void displayChapters();
+void displayTopics();
+void displayContent();
+void displayAPScreen();
+void handleButtons();
+
+// ================= FIXED TIME CONVERSION FUNCTIONS =================
+void convertUnixToTime(unsigned long unixTime) {
+  // Add IST offset (5 hours 30 minutes = 19800 seconds)
+  unsigned long localTime = unixTime + 19800;
+  
+  // Extract time components
+  seconds = localTime % 60;
+  unsigned long totalMinutes = localTime / 60;
+  minutes = totalMinutes % 60;
+  unsigned long totalHours = totalMinutes / 60;
+  hours = totalHours % 24;
+  
+  // Calculate days since epoch
+  unsigned long days = totalHours / 24;
+  
+  // Unix epoch started on Jan 1, 1970
+  // Start calculation from 1970
+  year = 1970;
+  
+  while (days >= 365) {
+    int daysInYear = ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)) ? 366 : 365;
+    if (days >= daysInYear) {
+      days -= daysInYear;
+      year++;
+    } else {
+      break;
+    }
+  }
+  
+  month = 1;
+  while (true) {
+    int daysInMonth = getDaysInMonth(month, year);
+    if (days >= daysInMonth) {
+      days -= daysInMonth;
+      month++;
+    } else {
+      break;
+    }
+  }
+  
+  day = days + 1;
+  
+  // Calculate day of week (Jan 1, 1970 was Thursday = 4)
+  // 0 = Sunday, 1 = Monday, 2 = Tuesday, 3 = Wednesday, 4 = Thursday, 5 = Friday, 6 = Saturday
+  unsigned long totalDaysSince1970 = (totalHours / 24);
+  weekDay = (4 + totalDaysSince1970) % 7;
+}
+
+void updateTimeFromUnix() {
+  convertUnixToTime(rtc_unixTime);
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  rtc_bootCount++;
+  Serial.println("ESP32-C3 Smart Watch - Boot #" + String(rtc_bootCount));
+  
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+  pinMode(BTN_BACK, INPUT_PULLUP);
+  pinMode(OLED_POWER_PIN, OUTPUT);
+  digitalWrite(OLED_POWER_PIN, HIGH);
+  
+  Wire.begin(SDA_PIN, SCL_PIN);
+  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  display.setRotation(2);
+  display.setTextColor(WHITE);
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(brightness);
+  
+  loadTimeFromRTC();
+  
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+  } else {
+    if (!SPIFFS.exists("/chapters.json")) {
+      addChapter("Getting Started");
+      addChapter("User Guide");
+      addChapter("Advanced");
+    }
+    loadChapters();
+  }
+  
+  display.clearDisplay();
+  display.setCursor(25, 20);
+  display.println("SMART");
+  display.setCursor(20, 40);
+  display.println("WATCH");
+  display.display();
+  delay(1000);
+  
+  lastActivityTime = millis();
+  lastTick = millis();
+  updateTimeFromUnix();
+  displayWatchFace();
+}
+
+void loadTimeFromRTC() {
+  if (rtc_timeSet && rtc_unixTime > 0) {
+    convertUnixToTime(rtc_unixTime);
+    Serial.printf("Time loaded from RTC: %02d:%02d:%02d %02d/%02d/%04d (Unix: %lu)\n", 
+                  hours, minutes, seconds, day, month, year, rtc_unixTime);
+  } else {
+    Serial.println("No time in RTC, will sync with WiFi");
+    rtc_unixTime = 0;
+  }
+}
+
+void saveTimeToRTC() {
+  rtc_unixTime = getCurrentUnixTime();
+  rtc_timeSet = true;
+  Serial.printf("Time saved to RTC: %lu\n", rtc_unixTime);
+}
+
+unsigned long getCurrentUnixTime() {
+  return rtc_unixTime + ((millis() - lastTick) / 1000);
+}
+
+// ================= TIME SYNC FUNCTION =================
+void syncTimeWithWiFi() {
+  Mode previousMode = currentMode;
+  currentMode = MODE_TIME_SYNC;
+  
+  display.clearDisplay();
+  display.setCursor(10, 15);
+  display.println("Sync Time");
+  display.drawLine(0, 25, 128, 25, WHITE);
+  display.setCursor(10, 38);
+  display.println("Connecting to WiFi...");
+  display.display();
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid, wifi_password);
+  
+  int attempts = 0;
+  
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    attempts++;
+    display.clearDisplay();
+    display.setCursor(10, 15);
+    display.println("Sync Time");
+    display.drawLine(0, 25, 128, 25, WHITE);
+    display.setCursor(10, 38);
+    display.print("Connecting");
+    for (int i = 0; i < (attempts / 3); i++) display.print(".");
+    display.display();
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    display.clearDisplay();
+    display.setCursor(10, 15);
+    display.println("Sync Time");
+    display.drawLine(0, 25, 128, 25, WHITE);
+    display.setCursor(10, 38);
+    display.println("Getting time from NTP...");
+    display.display();
+    
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    
+    struct tm timeinfo;
+    int syncAttempts = 0;
+    
+    while (!getLocalTime(&timeinfo) && syncAttempts < 20) {
+      delay(500);
+      syncAttempts++;
+      display.clearDisplay();
+      display.setCursor(10, 15);
+      display.println("Sync Time");
+      display.drawLine(0, 25, 128, 25, WHITE);
+      display.setCursor(10, 38);
+      display.print("Getting time");
+      for (int i = 0; i < (syncAttempts / 3); i++) display.print(".");
+      display.display();
+    }
+    
+    if (syncAttempts < 20) {
+      // Convert tm structure to Unix timestamp
+      time_t utcTime = mktime(&timeinfo);
+      rtc_unixTime = utcTime;
+      rtc_timeSet = true;
+      
+      updateTimeFromUnix();
+      
+      display.clearDisplay();
+      display.setCursor(10, 15);
+      display.println("Sync Time");
+      display.drawLine(0, 25, 128, 25, WHITE);
+      display.setCursor(20, 38);
+      display.println("SUCCESS!");
+      display.setCursor(10, 52);
+      char timeStr[20];
+      sprintf(timeStr, "%02d:%02d:%02d", hours, minutes, seconds);
+      display.println(timeStr);
+      display.display();
+      delay(2000);
+      
+      Serial.printf("Time synced: %02d:%02d:%02d %02d/%02d/%04d\n", 
+                    hours, minutes, seconds, day, month, year);
+    } else {
+      display.clearDisplay();
+      display.setCursor(10, 15);
+      display.println("Sync Time");
+      display.drawLine(0, 25, 128, 25, WHITE);
+      display.setCursor(10, 38);
+      display.println("NTP Timeout!");
+      display.display();
+      delay(2000);
+    }
+    
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  } else {
+    display.clearDisplay();
+    display.setCursor(10, 15);
+    display.println("Sync Time");
+    display.drawLine(0, 25, 128, 25, WHITE);
+    display.setCursor(10, 38);
+    display.println("WiFi Failed!");
+    display.display();
+    delay(2000);
+  }
+  
+  currentMode = previousMode;
+  lastTick = millis();
+  
+  if (currentMode == MODE_WATCH) {
+    displayWatchFace();
+  } else if (currentMode == MODE_READER) {
+    displayMenu();
+  }
+}
+
+// ================= TIME COUNTER =================
+void updateTimeCounter() {
+  unsigned long now = millis();
+  if (now - lastTick >= 1000) {
+    lastTick = now;
+    rtc_unixTime++;
+    updateTimeFromUnix();
+    
+    if (currentMode == MODE_WATCH) {
+      displayWatchFace();
+    }
+  }
+}
+
+int getDaysInMonth(int month, int year) {
+  if (month == 2) {
+    if ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)) return 29;
+    return 28;
+  }
+  if (month == 4 || month == 6 || month == 9 || month == 11) return 30;
+  return 31;
+}
+
+// ================= FILE MANAGEMENT =================
+void loadChapters() {
+  File file = SPIFFS.open("/chapters.json", FILE_READ);
+  if (!file) return;
+  
+  DynamicJsonDocument doc(2048);
+  deserializeJson(doc, file);
+  JsonArray arr = doc.as<JsonArray>();
+  chapterCount = 0;
+  for (JsonVariant v : arr) {
+    if (chapterCount < MAX_CHAPTERS) chapters[chapterCount++] = v.as<String>();
+  }
+  file.close();
+}
+
+void saveChapters() {
+  DynamicJsonDocument doc(2048);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < chapterCount; i++) arr.add(chapters[i]);
+  
+  File file = SPIFFS.open("/chapters.json", FILE_WRITE);
+  serializeJson(doc, file);
+  file.close();
+}
+
+void loadTopics(int ch) {
+  String path = "/ch" + String(ch + 1) + ".json";
+  File file = SPIFFS.open(path, FILE_READ);
+  topicCount = 0;
+  if (!file) return;
+  
+  DynamicJsonDocument doc(2048);
+  deserializeJson(doc, file);
+  JsonArray arr = doc.as<JsonArray>();
+  for (JsonVariant v : arr) {
+    if (topicCount < MAX_TOPICS) topics[topicCount++] = v.as<String>();
+  }
+  file.close();
+}
+
+void saveTopics(int ch) {
+  String path = "/ch" + String(ch + 1) + ".json";
+  DynamicJsonDocument doc(2048);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < topicCount; i++) arr.add(topics[i]);
+  
+  File file = SPIFFS.open(path, FILE_WRITE);
+  serializeJson(doc, file);
+  file.close();
+}
+
+void loadContent(int ch, int topic) {
+  String path = "/ch" + String(ch + 1) + "_" + String(topic + 1) + ".txt";
+  File file = SPIFFS.open(path, FILE_READ);
+  lineCount = 0;
+  
+  if (!file) {
+    textLines[lineCount++] = "No content";
+    return;
+  }
+  
+  while (file.available() && lineCount < MAX_LINES) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    while (line.length() > 21 && lineCount < MAX_LINES) {
+      int wrap = 21;
+      for (int i = 21; i > 15; i--) {
+        if (i < line.length() && line.charAt(i) == ' ') {
+          wrap = i;
+          break;
+        }
+      }
+      textLines[lineCount++] = line.substring(0, wrap);
+      line = line.substring(wrap);
+      line.trim();
+    }
+    if (line.length() > 0 && lineCount < MAX_LINES) {
+      textLines[lineCount++] = line;
+    }
+  }
+  file.close();
+}
+
+bool saveContent(int ch, int topic, String content) {
+  String path = "/ch" + String(ch + 1) + "_" + String(topic + 1) + ".txt";
+  File file = SPIFFS.open(path, FILE_WRITE);
+  if (!file) return false;
+  file.print(content);
+  file.close();
+  return true;
+}
+
+void addChapter(String name) {
+  if (chapterCount >= MAX_CHAPTERS) return;
+  chapters[chapterCount++] = name;
+  saveChapters();
+  
+  topicCount = 0;
+  for (int i = 1; i <= 3; i++) {
+    topics[topicCount++] = "Topic " + String(i);
+  }
+  saveTopics(chapterCount - 1);
+  
+  for (int i = 0; i < topicCount; i++) {
+    saveContent(chapterCount - 1, i, "Content for " + name + " - " + topics[i] + "\n\nEdit this via WiFi.");
+  }
+}
+
+void deleteChapter(int ch) {
+  if (ch < 0 || ch >= chapterCount) return;
+  
+  for (int i = ch; i < chapterCount - 1; i++) {
+    chapters[i] = chapters[i + 1];
+    for (int t = 0; t < MAX_TOPICS; t++) {
+      String oldPath = "/ch" + String(i + 2) + "_" + String(t + 1) + ".txt";
+      String newPath = "/ch" + String(i + 1) + "_" + String(t + 1) + ".txt";
+      if (SPIFFS.exists(oldPath)) {
+        File f = SPIFFS.open(oldPath, FILE_READ);
+        String content = f.readString();
+        f.close();
+        File wf = SPIFFS.open(newPath, FILE_WRITE);
+        wf.print(content);
+        wf.close();
+        SPIFFS.remove(oldPath);
+      }
+    }
+    String oldTopic = "/ch" + String(i + 2) + ".json";
+    String newTopic = "/ch" + String(i + 1) + ".json";
+    if (SPIFFS.exists(oldTopic)) SPIFFS.rename(oldTopic, newTopic);
+  }
+  chapterCount--;
+  saveChapters();
+}
+
+void addTopic(int ch, String name) {
+  if (ch < 0 || ch >= chapterCount) return;
+  loadTopics(ch);
+  if (topicCount >= MAX_TOPICS) return;
+  topics[topicCount++] = name;
+  saveTopics(ch);
+  saveContent(ch, topicCount - 1, "Content for " + chapters[ch] + " - " + name + "\n\nEdit this via WiFi.");
+}
+
+void deleteTopic(int ch, int topic) {
+  if (ch < 0 || ch >= chapterCount) return;
+  loadTopics(ch);
+  if (topic < 0 || topic >= topicCount) return;
+  
+  for (int i = topic; i < topicCount - 1; i++) {
+    topics[i] = topics[i + 1];
+    String oldPath = "/ch" + String(ch + 1) + "_" + String(i + 2) + ".txt";
+    String newPath = "/ch" + String(ch + 1) + "_" + String(i + 1) + ".txt";
+    if (SPIFFS.exists(oldPath)) {
+      File f = SPIFFS.open(oldPath, FILE_READ);
+      String content = f.readString();
+      f.close();
+      File wf = SPIFFS.open(newPath, FILE_WRITE);
+      wf.print(content);
+      wf.close();
+      SPIFFS.remove(oldPath);
+    }
+  }
+  topicCount--;
+  saveTopics(ch);
+}
+
+void renameChapter(int ch, String name) {
+  if (ch >= 0 && ch < chapterCount) {
+    chapters[ch] = name;
+    saveChapters();
+  }
+}
+
+void renameTopic(int ch, int topic, String name) {
+  loadTopics(ch);
+  if (topic >= 0 && topic < topicCount) {
+    topics[topic] = name;
+    saveTopics(ch);
+  }
+}
+
+// ================= WEB SERVER =================
+void setupAPMode() {
+  if (apEnabled) return;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
+  apEnabled = true;
+  setupWebServer();
+  showMessage("AP Mode: FPV_CAM");
+}
+
+void stopAPMode() {
+  if (!apEnabled) return;
+  WiFi.softAPdisconnect(true);
+  apEnabled = false;
+}
+
+void setupWebServer() {
+  server.on("/", []() {
+    String html = "<!DOCTYPE html><html>";
+    html += "<head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<title>E-Reader Manager</title>";
+    html += "<style>";
+    html += "body{font-family:Arial;background:#1a1a2e;margin:0;padding:20px;color:#eee}";
+    html += ".container{max-width:800px;margin:auto}";
+    html += ".card{background:#16213e;border-radius:10px;padding:20px;margin-bottom:20px}";
+    html += "button{background:#e94560;color:white;padding:8px 15px;border:none;border-radius:5px;cursor:pointer;margin:5px}";
+    html += "button:hover{opacity:0.8}";
+    html += ".btn-green{background:#4CAF50}";
+    html += ".btn-blue{background:#2196F3}";
+    html += ".btn-orange{background:#ff9800}";
+    html += ".btn-red{background:#f44336}";
+    html += "input,textarea{width:100%;padding:10px;margin:10px 0;background:#0f3460;border:1px solid #e94560;border-radius:5px;color:white}";
+    html += ".topic-item{background:#0a0a2a;padding:10px;margin:5px 0;border-radius:5px}";
+    html += ".modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);justify-content:center;align-items:center}";
+    html += ".modal-content{background:#16213e;padding:30px;border-radius:10px;max-width:400px}";
+    html += "</style>";
+    html += "</head><body>";
+    html += "<div class='container'>";
+    html += "<div class='card'><h2>E-Reader Manager</h2>";
+    html += "<button class='btn-green' onclick='showAddChapter()'>Add Chapter</button>";
+    html += "<button onclick='location.reload()'>Refresh</button></div>";
+    
+    for (int i = 0; i < chapterCount; i++) {
+      html += "<div class='card'>";
+      html += "<h3>" + chapters[i] + "</h3>";
+      html += "<button class='btn-blue' onclick='renameChapter(" + String(i) + ",\"" + chapters[i] + "\")'>Rename</button>";
+      html += "<button class='btn-red' onclick='deleteChapter(" + String(i) + ",\"" + chapters[i] + "\")'>Delete</button>";
+      html += "<button class='btn-green' onclick='showAddTopic(" + String(i) + ")'>Add Topic</button>";
+      
+      loadTopics(i);
+      for (int t = 0; t < topicCount; t++) {
+        html += "<div class='topic-item'>";
+        html += "<b>" + topics[t] + "</b><br>";
+        html += "<button class='btn-orange' onclick='renameTopic(" + String(i) + "," + String(t) + ",\"" + topics[t] + "\")'>Rename</button>";
+        html += "<button class='btn-red' onclick='deleteTopic(" + String(i) + "," + String(t) + ",\"" + topics[t] + "\")'>Delete</button>";
+        html += "<button class='btn-green' onclick='editContent(" + String(i+1) + "," + String(t+1) + ")'>Edit</button>";
+        html += "</div>";
+      }
+      html += "</div>";
+    }
+    
+    html += "</div>";
+    
+    html += "<div id='addChapterModal' class='modal'><div class='modal-content'><h3>Add Chapter</h3><input id='chName' placeholder='Chapter name'><br><button class='btn-green' onclick='addChapter()'>Create</button><button onclick='closeModal()'>Cancel</button></div></div>";
+    html += "<div id='addTopicModal' class='modal'><div class='modal-content'><h3>Add Topic</h3><input id='tpName' placeholder='Topic name'><br><button class='btn-green' onclick='addTopic()'>Create</button><button onclick='closeModal()'>Cancel</button></div></div>";
+    html += "<div id='renameChapterModal' class='modal'><div class='modal-content'><h3>Rename Chapter</h3><input id='rcName'><br><button class='btn-orange' onclick='renameChapterSubmit()'>Rename</button><button onclick='closeModal()'>Cancel</button></div></div>";
+    html += "<div id='renameTopicModal' class='modal'><div class='modal-content'><h3>Rename Topic</h3><input id='rtName'><br><button class='btn-orange' onclick='renameTopicSubmit()'>Rename</button><button onclick='closeModal()'>Cancel</button></div></div>";
+    
+    html += "<script>";
+    html += "let chapterIdx, topicIdx;";
+    html += "function showAddChapter(){document.getElementById('addChapterModal').style.display='flex';}";
+    html += "function showAddTopic(idx){chapterIdx=idx;document.getElementById('addTopicModal').style.display='flex';}";
+    html += "function renameChapter(idx,name){chapterIdx=idx;document.getElementById(
