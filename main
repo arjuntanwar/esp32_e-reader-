@@ -637,4 +637,491 @@ void setupWebServer() {
     html += "let chapterIdx, topicIdx;";
     html += "function showAddChapter(){document.getElementById('addChapterModal').style.display='flex';}";
     html += "function showAddTopic(idx){chapterIdx=idx;document.getElementById('addTopicModal').style.display='flex';}";
-    html += "function renameChapter(idx,name){chapterIdx=idx;document.getElementById(
+    html += "function renameChapter(idx,name){chapterIdx=idx;document.getElementById('rcName').value=name;document.getElementById('renameChapterModal').style.display='flex';}";
+    html += "function renameTopic(idx,tidx,name){chapterIdx=idx;topicIdx=tidx;document.getElementById('rtName').value=name;document.getElementById('renameTopicModal').style.display='flex';}";
+    html += "function addChapter(){let n=document.getElementById('chName').value;fetch('/api/add_chapter',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}).then(()=>location.reload());}";
+    html += "function addTopic(){let n=document.getElementById('tpName').value;fetch('/api/add_topic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chapter:chapterIdx,name:n})}).then(()=>location.reload());}";
+    html += "function deleteChapter(idx,name){if(confirm('Delete '+name+'?')){fetch('/api/delete_chapter?chapter='+idx).then(()=>location.reload());}}";
+    html += "function deleteTopic(idx,tidx,name){if(confirm('Delete '+name+'?')){fetch('/api/delete_topic?chapter='+idx+'&topic='+tidx).then(()=>location.reload());}}";
+    html += "function renameChapterSubmit(){let n=document.getElementById('rcName').value;fetch('/api/rename_chapter',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chapter:chapterIdx,name:n})}).then(()=>location.reload());}";
+    html += "function renameTopicSubmit(){let n=document.getElementById('rtName').value;fetch('/api/rename_topic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chapter:chapterIdx,topic:topicIdx,name:n})}).then(()=>location.reload());}";
+    html += "function editContent(ch,tp){window.location.href='/edit?c='+ch+'&t='+tp;}";
+    html += "function closeModal(){document.querySelectorAll('.modal').forEach(m=>m.style.display='none');}";
+    html += "window.onclick=function(e){if(e.target.classList.contains('modal'))e.target.style.display='none';}";
+    html += "</script>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+  
+  server.on("/edit", []() {
+    int ch = server.arg("c").toInt();
+    int tp = server.arg("t").toInt();
+    String content = "";
+    String path = "/ch" + String(ch) + "_" + String(tp) + ".txt";
+    File f = SPIFFS.open(path, FILE_READ);
+    while (f.available()) content += (char)f.read();
+    f.close();
+    
+    String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<title>Edit Content</title><style>";
+    html += "body{font-family:Arial;background:#1a1a2e;padding:20px;color:#eee}";
+    html += ".container{max-width:800px;margin:auto}";
+    html += "textarea{width:100%;height:400px;padding:10px;background:#0f3460;border:1px solid #e94560;border-radius:5px;color:white;font-family:monospace}";
+    html += "button{background:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin:10px 5px}";
+    html += "</style></head><body>";
+    html += "<div class='container'>";
+    html += "<h2>Edit Content</h2>";
+    html += "<form method='POST' action='/save'>";
+    html += "<input type='hidden' name='c' value='" + String(ch) + "'>";
+    html += "<input type='hidden' name='t' value='" + String(tp) + "'>";
+    html += "<textarea name='content'>" + content + "</textarea><br>";
+    html += "<button type='submit'>Save</button>";
+    html += "<button type='button' onclick='location.href=\"/\"'>Back</button>";
+    html += "</form></div></body></html>";
+    server.send(200, "text/html", html);
+  });
+  
+  server.on("/save", HTTP_POST, []() {
+    int ch = server.arg("c").toInt();
+    int tp = server.arg("t").toInt();
+    String content = server.arg("content");
+    String path = "/ch" + String(ch) + "_" + String(tp) + ".txt";
+    File f = SPIFFS.open(path, FILE_WRITE);
+    f.print(content);
+    f.close();
+    server.send(200, "text/html", "<html><body><script>location.href='/';</script></body></html>");
+  });
+  
+  server.on("/api/add_chapter", HTTP_POST, []() {
+    DynamicJsonDocument doc(256);
+    deserializeJson(doc, server.arg("plain"));
+    addChapter(doc["name"].as<String>());
+    server.send(200, "application/json", "{\"success\":true}");
+  });
+  
+  server.on("/api/delete_chapter", HTTP_GET, []() {
+    deleteChapter(server.arg("chapter").toInt());
+    server.send(200, "application/json", "{\"success\":true}");
+  });
+  
+  server.on("/api/add_topic", HTTP_POST, []() {
+    DynamicJsonDocument doc(256);
+    deserializeJson(doc, server.arg("plain"));
+    addTopic(doc["chapter"].as<int>(), doc["name"].as<String>());
+    server.send(200, "application/json", "{\"success\":true}");
+  });
+  
+  server.on("/api/delete_topic", HTTP_GET, []() {
+    deleteTopic(server.arg("chapter").toInt(), server.arg("topic").toInt());
+    server.send(200, "application/json", "{\"success\":true}");
+  });
+  
+  server.on("/api/rename_chapter", HTTP_POST, []() {
+    DynamicJsonDocument doc(256);
+    deserializeJson(doc, server.arg("plain"));
+    renameChapter(doc["chapter"].as<int>(), doc["name"].as<String>());
+    server.send(200, "application/json", "{\"success\":true}");
+  });
+  
+  server.on("/api/rename_topic", HTTP_POST, []() {
+    DynamicJsonDocument doc(256);
+    deserializeJson(doc, server.arg("plain"));
+    renameTopic(doc["chapter"].as<int>(), doc["topic"].as<int>(), doc["name"].as<String>());
+    server.send(200, "application/json", "{\"success\":true}");
+  });
+  
+  server.begin();
+}
+
+// ================= DISPLAY FUNCTIONS =================
+String getWeekday() {
+  String days[7] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+  return days[weekDay];
+}
+
+void displayWatchFace() {
+  display.clearDisplay();
+  
+  String timeStr = "";
+  if (hours < 10) timeStr += "0";
+  timeStr += String(hours) + ":";
+  if (minutes < 10) timeStr += "0";
+  timeStr += String(minutes);
+  
+  String dateStr = getWeekday() + " ";
+  if (day < 10) dateStr += "0";
+  dateStr += String(day) + "/";
+  if (month < 10) dateStr += "0";
+  dateStr += String(month);
+  
+  String secStr = "";
+  if (seconds < 10) secStr += "0";
+  secStr += String(seconds);
+  
+  display.setTextSize(3);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((128 - w) / 2, 15);
+  display.print(timeStr);
+  
+  display.setTextSize(1);
+  display.getTextBounds(secStr, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((128 - w) / 2, 42);
+  display.print(secStr);
+  
+  display.getTextBounds(dateStr, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((128 - w) / 2, 54);
+  display.print(dateStr);
+  
+  display.display();
+}
+
+void showMessage(String msg) {
+  display.clearDisplay();
+  display.setCursor(10, 30);
+  display.print(msg);
+  display.display();
+  delay(1500);
+}
+
+void displayMenu() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("E-Reader");
+  display.drawLine(0, 10, 128, 10, WHITE);
+  
+  const char* items[] = {"Start Reading", "AP Mode", "Update Time", "Exit"};
+  for (int i = 0; i < 4; i++) {
+    display.setCursor(0, 20 + i * 10);
+    if (i == readerCursor) {
+      display.print("> ");
+      display.setTextColor(BLACK, WHITE);
+      display.print(items[i]);
+      display.setTextColor(WHITE);
+    } else {
+      display.print("  ");
+      display.print(items[i]);
+    }
+  }
+  display.display();
+}
+
+void displayChapters() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Chapters");
+  display.drawLine(0, 10, 128, 10, WHITE);
+  
+  if (selectedChapter < readerScrollTop) readerScrollTop = selectedChapter;
+  if (selectedChapter >= readerScrollTop + VISIBLE_ITEMS) readerScrollTop = selectedChapter - VISIBLE_ITEMS + 1;
+  
+  for (int i = 0; i < VISIBLE_ITEMS; i++) {
+    int idx = readerScrollTop + i;
+    if (idx >= chapterCount) break;
+    int y = 14 + i * 10;
+    String txt = chapters[idx];
+    if (txt.length() > 16) txt = txt.substring(0, 13) + "...";
+    
+    if (idx == selectedChapter) {
+      display.fillRect(0, y-1, 128, 10, WHITE);
+      display.setTextColor(BLACK);
+      display.setCursor(2, y);
+      display.print("> ");
+      display.print(txt);
+      display.setTextColor(WHITE);
+    } else {
+      display.setCursor(2, y);
+      display.print("  ");
+      display.print(txt);
+    }
+  }
+  display.setCursor(0, 54);
+  display.print(selectedChapter+1);
+  display.print("/");
+  display.print(chapterCount);
+  display.display();
+}
+
+void displayTopics() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  String title = currentChapter;
+  if (title.length() > 16) title = title.substring(0, 13) + "...";
+  display.print(title);
+  display.drawLine(0, 10, 128, 10, WHITE);
+  
+  if (selectedTopic < readerScrollTop) readerScrollTop = selectedTopic;
+  if (selectedTopic >= readerScrollTop + VISIBLE_ITEMS) readerScrollTop = selectedTopic - VISIBLE_ITEMS + 1;
+  
+  for (int i = 0; i < VISIBLE_ITEMS; i++) {
+    int idx = readerScrollTop + i;
+    if (idx >= topicCount) break;
+    int y = 14 + i * 10;
+    String txt = topics[idx];
+    if (txt.length() > 16) txt = txt.substring(0, 13) + "...";
+    
+    if (idx == selectedTopic) {
+      display.fillRect(0, y-1, 128, 10, WHITE);
+      display.setTextColor(BLACK);
+      display.setCursor(2, y);
+      display.print("> ");
+      display.print(txt);
+      display.setTextColor(WHITE);
+    } else {
+      display.setCursor(2, y);
+      display.print("  ");
+      display.print(txt);
+    }
+  }
+  display.setCursor(0, 54);
+  display.print(selectedTopic+1);
+  display.print("/");
+  display.print(topicCount);
+  display.display();
+}
+
+void displayContent() {
+  int startLine = scrollPosition;
+  if (startLine < 0) startLine = 0;
+  if (startLine >= lineCount) startLine = lineCount - LINES_PER_SCREEN;
+  if (startLine < 0) startLine = 0;
+  
+  display.clearDisplay();
+  for (int i = 0; i < LINES_PER_SCREEN; i++) {
+    int idx = startLine + i;
+    if (idx >= lineCount) break;
+    display.setCursor(0, i * 8);
+    String line = textLines[idx];
+    if (line.length() > 21) line = line.substring(0, 18) + "..";
+    display.println(line);
+  }
+  display.display();
+}
+
+void displayAPScreen() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("AP Mode");
+  display.drawLine(0, 10, 128, 10, WHITE);
+  display.setCursor(15, 25);
+  display.println("FPV_CAM");
+  display.setCursor(15, 40);
+  display.println("Open 192.168.4.1");
+  display.setCursor(15, 55);
+  display.println("Press BACK to exit");
+  display.display();
+}
+
+// ================= SLEEP FUNCTION WITH TIME TRACKING =================
+void goToSleep() {
+  if (currentMode == MODE_READER && readerScreen == SCR_READ) {
+    rtc_lastChapter = selectedChapter;
+    rtc_lastTopic = selectedTopic;
+    rtc_lastScrollPos = scrollPosition;
+    rtc_hasResumeData = true;
+  }
+  
+  rtc_sleepEnterTime = esp_timer_get_time();
+  rtc_unixTime = getCurrentUnixTime();
+  rtc_timeSet = true;
+  
+  display.clearDisplay();
+  display.display();
+  digitalWrite(OLED_POWER_PIN, LOW);
+  
+  if (apEnabled) stopAPMode();
+  WiFi.mode(WIFI_OFF);
+  
+  esp_sleep_enable_gpio_wakeup();
+  gpio_wakeup_enable((gpio_num_t)BTN_SELECT, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)BTN_UP, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)BTN_DOWN, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)BTN_BACK, GPIO_INTR_LOW_LEVEL);
+  
+  Serial.println("Entering light sleep...");
+  esp_light_sleep_start();
+  
+  uint64_t wakeTime = esp_timer_get_time();
+  uint64_t sleepDuration = (wakeTime - rtc_sleepEnterTime) / 1000000ULL;
+  rtc_unixTime += sleepDuration;
+  
+  Serial.printf("Slept for %llu seconds\n", sleepDuration);
+  
+  updateTimeFromUnix();
+  
+  digitalWrite(OLED_POWER_PIN, HIGH);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  display.setRotation(2);
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(brightness);
+  
+  lastActivityTime = millis();
+  lastTick = millis() - 1000;
+  
+  if (currentMode == MODE_WATCH) {
+    displayWatchFace();
+  } else {
+    displayMenu();
+  }
+}
+
+void handleButtons() {
+  unsigned long now = millis();
+  if (now - lastButtonTime < DEBOUNCE_DELAY) return;
+  
+  bool up = digitalRead(BTN_UP) == LOW;
+  bool down = digitalRead(BTN_DOWN) == LOW;
+  bool sel = digitalRead(BTN_SELECT) == LOW;
+  bool back = digitalRead(BTN_BACK) == LOW;
+  
+  if (up || down || sel || back) lastActivityTime = now;
+  
+  if (currentMode == MODE_WATCH && up && back) {
+    lastButtonTime = now;
+    goToSleep();
+    return;
+  }
+  
+  if (currentMode == MODE_WATCH && sel && up) {
+    lastButtonTime = now;
+    currentMode = MODE_READER;
+    readerScreen = SCR_MAIN;
+    readerCursor = 0;
+    if (rtc_hasResumeData && rtc_lastChapter < chapterCount) {
+      selectedChapter = rtc_lastChapter;
+      selectedTopic = rtc_lastTopic;
+      scrollPosition = rtc_lastScrollPos;
+      currentChapter = chapters[selectedChapter];
+      loadTopics(selectedChapter);
+      loadContent(selectedChapter, selectedTopic);
+      readerScreen = SCR_READ;
+    }
+    displayMenu();
+    return;
+  }
+  
+  if ((currentMode == MODE_READER || currentMode == MODE_AP) && sel && back) {
+    lastButtonTime = now;
+    if (currentMode == MODE_READER && readerScreen == SCR_READ) {
+      rtc_lastChapter = selectedChapter;
+      rtc_lastTopic = selectedTopic;
+      rtc_lastScrollPos = scrollPosition;
+      rtc_hasResumeData = true;
+      rtc_unixTime = getCurrentUnixTime();
+      rtc_timeSet = true;
+    }
+    if (apEnabled) stopAPMode();
+    currentMode = MODE_WATCH;
+    readerScreen = SCR_MAIN;
+    displayWatchFace();
+    return;
+  }
+  
+  if (currentMode == MODE_READER) {
+    if (up && !down && !sel && !back) {
+      lastButtonTime = now;
+      if (readerScreen == SCR_MAIN && readerCursor > 0) readerCursor--;
+      else if (readerScreen == SCR_CHAPTERS && selectedChapter > 0) selectedChapter--;
+      else if (readerScreen == SCR_TOPICS && selectedTopic > 0) selectedTopic--;
+      else if (readerScreen == SCR_READ && scrollPosition > 0) scrollPosition--;
+      
+      if (readerScreen == SCR_READ) displayContent();
+      else if (readerScreen == SCR_CHAPTERS) displayChapters();
+      else if (readerScreen == SCR_TOPICS) displayTopics();
+      else displayMenu();
+    }
+    else if (down && !up && !sel && !back) {
+      lastButtonTime = now;
+      if (readerScreen == SCR_MAIN && readerCursor < 3) readerCursor++;
+      else if (readerScreen == SCR_CHAPTERS && selectedChapter < chapterCount-1) selectedChapter++;
+      else if (readerScreen == SCR_TOPICS && selectedTopic < topicCount-1) selectedTopic++;
+      else if (readerScreen == SCR_READ && scrollPosition + LINES_PER_SCREEN < lineCount) scrollPosition++;
+      
+      if (readerScreen == SCR_READ) displayContent();
+      else if (readerScreen == SCR_CHAPTERS) displayChapters();
+      else if (readerScreen == SCR_TOPICS) displayTopics();
+      else displayMenu();
+    }
+    else if (sel && !up && !down && !back) {
+      lastButtonTime = now;
+      if (readerScreen == SCR_MAIN) {
+        if (readerCursor == 0) {
+          readerScreen = SCR_CHAPTERS;
+          selectedChapter = 0;
+          displayChapters();
+        } else if (readerCursor == 1) {
+          currentMode = MODE_AP;
+          setupAPMode();
+          displayAPScreen();
+        } else if (readerCursor == 2) {
+          syncTimeWithWiFi();
+          displayMenu();
+        } else if (readerCursor == 3) {
+          if (apEnabled) stopAPMode();
+          currentMode = MODE_WATCH;
+          displayWatchFace();
+        }
+      }
+      else if (readerScreen == SCR_CHAPTERS) {
+        currentChapter = chapters[selectedChapter];
+        loadTopics(selectedChapter);
+        readerScreen = SCR_TOPICS;
+        selectedTopic = 0;
+        displayTopics();
+      }
+      else if (readerScreen == SCR_TOPICS) {
+        loadContent(selectedChapter, selectedTopic);
+        readerScreen = SCR_READ;
+        scrollPosition = 0;
+        displayContent();
+      }
+    }
+    else if (back && !up && !down && !sel) {
+      lastButtonTime = now;
+      if (readerScreen == SCR_MAIN) {
+        if (apEnabled) stopAPMode();
+        currentMode = MODE_WATCH;
+        displayWatchFace();
+      }
+      else if (readerScreen == SCR_CHAPTERS) {
+        readerScreen = SCR_MAIN;
+        readerCursor = 0;
+        displayMenu();
+      }
+      else if (readerScreen == SCR_TOPICS) {
+        readerScreen = SCR_CHAPTERS;
+        displayChapters();
+      }
+      else if (readerScreen == SCR_READ) {
+        readerScreen = SCR_TOPICS;
+        displayTopics();
+      }
+    }
+  }
+  else if (currentMode == MODE_AP) {
+    server.handleClient();
+    if (back && !up && !down && !sel) {
+      lastButtonTime = now;
+      stopAPMode();
+      currentMode = MODE_READER;
+      readerScreen = SCR_MAIN;
+      displayMenu();
+    }
+  }
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+  updateTimeCounter();
+  handleButtons();
+  
+  if (currentMode == MODE_WATCH) {
+    if (millis() - lastActivityTime >= WATCH_SLEEP_TIMEOUT_MS) {
+      goToSleep();
+    }
+  }
+  
+  delay(10);
+}
